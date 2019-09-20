@@ -30,6 +30,12 @@ type Conn interface {
 	SetContext(v interface{})
 	Namespace() string
 	Emit(msg string, v ...interface{})
+
+	// Broadcast server side apis
+	Join(room string)
+	Leave(room string)
+	LeaveAll()
+	Rooms() []string
 }
 
 type errorMessage struct {
@@ -44,6 +50,7 @@ type writePacket struct {
 
 type conn struct {
 	engineio.Conn
+	broadcast  Broadcast
 	encoder    *parser.Encoder
 	decoder    *parser.Decoder
 	errorChan  chan errorMessage
@@ -55,9 +62,10 @@ type conn struct {
 	id         uint64
 }
 
-func newConn(c engineio.Conn, handlers map[string]*namespaceHandler) (*conn, error) {
+func newConn(c engineio.Conn, handlers map[string]*namespaceHandler, broadcast Broadcast) (*conn, error) {
 	ret := &conn{
 		Conn:       c,
+		broadcast:  broadcast,
 		encoder:    parser.NewEncoder(c),
 		decoder:    parser.NewDecoder(c),
 		errorChan:  make(chan errorMessage),
@@ -70,15 +78,19 @@ func newConn(c engineio.Conn, handlers map[string]*namespaceHandler) (*conn, err
 		ret.Close()
 		return nil, err
 	}
-	go ret.serveError()
-	go ret.serveWrite()
-	go ret.serveRead()
 	return ret, nil
 }
 
 func (c *conn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		// For each namespace, leave all rooms, and call the disconnect handler.
+		for ns, nc := range c.namespaces {
+			nc.LeaveAll()
+			if nh := c.handlers[ns]; nh != nil {
+				nh.onDisconnect(nc, "bye")
+			}
+		}
 		err = c.Conn.Close()
 		close(c.quitChan)
 	})
@@ -86,17 +98,23 @@ func (c *conn) Close() error {
 }
 
 func (c *conn) connect() error {
-	root := newNamespaceConn(c, "/")
+	root := newNamespaceConn(c, "/", c.broadcast)
 	c.namespaces[""] = root
 	header := parser.Header{
 		Type: parser.Connect,
 	}
-	handler, ok := c.handlers[header.Namespace]
-	if ok {
-		handler.dispatch(root, header, "", nil)
-	}
+
 	if err := c.encoder.Encode(header, nil); err != nil {
 		return err
+	}
+	handler, ok := c.handlers[header.Namespace]
+
+	go c.serveError()
+	go c.serveWrite()
+	go c.serveRead()
+
+	if ok {
+		handler.dispatch(root, header, "", nil)
 	}
 
 	return nil
@@ -147,7 +165,9 @@ func (c *conn) serveError() {
 			return
 		case msg := <-c.errorChan:
 			if handler := c.namespace(msg.namespace); handler != nil {
-				handler.onError(msg.error)
+				if handler.onError != nil {
+					handler.onError(msg.error)
+				}
 			}
 		}
 	}
@@ -220,7 +240,7 @@ func (c *conn) serveRead() {
 			}
 			conn, ok := c.namespaces[header.Namespace]
 			if !ok {
-				conn = newNamespaceConn(c, header.Namespace)
+				conn = newNamespaceConn(c, header.Namespace, c.broadcast)
 				c.namespaces[header.Namespace] = conn
 			}
 			handler, ok := c.handlers[header.Namespace]
